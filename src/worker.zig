@@ -42,10 +42,23 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         conn_node_pool: std.heap.MemoryPool(ConnNode),
         thread_pool: ThreadPool(Self.handleConnection),
 
+        // Set once the accept loop exits and the shutdown sweep starts. A
+        // connection that was busy (running a handler) when the sweep ran is
+        // skipped by it, so it has to notice the shutdown itself before going
+        // back to a blocking read - otherwise shutdown would never complete.
+        shutting_down: std.atomic.Value(bool) = .init(false),
+
         const ConnNode = struct {
             next: ?*ConnNode,
             prev: ?*ConnNode,
             socket: posix.fd_t,
+
+            // True while the application's handler (and the response write that
+            // follows it) owns this connection. The shutdown sweep in `listen`
+            // must not close these sockets: the handler may still be writing a
+            // response, or it may call res.disown() and take over ownership.
+            // Only ever read/written while `Self.mut` is held.
+            busy: bool = false,
         };
 
         const Timeout = struct {
@@ -159,12 +172,20 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 thread_pool.spawnOne(.{ self, socket, address });
             }
 
+            self.shutting_down.store(true, .release);
             {
                 self.mut.lockUncancelable(io);
                 defer self.mut.unlock(io);
                 var node = self.connections.head;
                 while (node) |n| {
                     node = n.next;
+                    // Close the sockets of connections parked in a blocking read so
+                    // that their threads wake up with EBADF and exit. Connections
+                    // currently inside an application handler are left alone: we
+                    // no longer own those sockets (the handler may have called
+                    // res.disown()), and closing them would make a later
+                    // posix.close() from the app trip over EBADF.
+                    if (n.busy) continue;
                     posix.close(n.socket);
                 }
             }
@@ -215,8 +236,19 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
             var is_keepalive = false;
             while (true) {
-                switch (self.handleRequest(conn, is_keepalive, thread_buf) catch .close) {
+                switch (self.handleRequest(connection_node, conn, is_keepalive, thread_buf) catch .close) {
                     .keepalive => {
+                        if (self.shutting_down.load(.acquire)) {
+                            // A shutdown began while we were serving the request.
+                            // The sweep in `listen` skipped us because we were
+                            // busy, so we still own the socket and must close it
+                            // ourselves - going back to a read would block this
+                            // thread forever and shutdown would never finish.
+                            posix.close(socket);
+                            conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
+                            self.http_conn_pool.release(conn);
+                            return;
+                        }
                         is_keepalive = true;
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                     },
@@ -232,6 +264,18 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
+
+                        // The websocket worker owns the socket from here on. It has
+                        // its own shutdown path (`websocket.shutdown()` is called
+                        // by stop() and shuts down the read side of every
+                        // connection) and closes the socket itself, so the sweep in
+                        // `listen` must not close it out from under it.
+                        {
+                            self.mut.lockUncancelable(io);
+                            defer self.mut.unlock(io);
+                            connection_node.busy = true;
+                        }
+
                         // blocking read loop
                         // will close the connection
                         self.handleWebSocket(hc) catch |err| {
@@ -249,7 +293,13 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
         }
 
-        fn handleRequest(self: *const Self, conn: *HTTPConn, is_keepalive: bool, thread_buf: []u8) !HTTPConn.Handover {
+        fn handleRequest(
+            self: *Self,
+            connection_node: *ConnNode,
+            conn: *HTTPConn,
+            is_keepalive: bool,
+            thread_buf: []u8,
+        ) !HTTPConn.Handover {
             const io = self.io;
             const socket = conn.stream.socket.handle;
             const timeout: ?Timeout = if (is_keepalive) self.timeout_keepalive else self.timeout_request;
@@ -320,6 +370,19 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
 
             metrics.request();
+            {
+                // We're past the blocking read: from here until the response has
+                // been written the connection belongs to the handler, so tell the
+                // shutdown sweep to leave our socket alone.
+                self.mut.lockUncancelable(io);
+                defer self.mut.unlock(io);
+                connection_node.busy = true;
+            }
+            defer {
+                self.mut.lockUncancelable(io);
+                defer self.mut.unlock(io);
+                connection_node.busy = false;
+            }
             self.server.handleRequest(conn, thread_buf);
             return conn.handover;
         }

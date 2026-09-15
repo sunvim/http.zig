@@ -2346,30 +2346,26 @@ fn testReadHeader(stream: Io.net.Stream) testing.Testing.Response {
     var pos: usize = 0;
     var blocked = false;
     var buf: [1024]u8 = undefined;
-    var reader = stream.reader(t.io, &.{});
-    const r = &reader.interface;
+    const socket = stream.socket.handle;
+
+    // NOTE: this deliberately does not go through
+    // `std.Io.net.Stream.reader`. In 0.16 a socket read that times out
+    // (SO_RCVTIMEO, which the tests set on every socket) is reported by the `Io`
+    // vtable as a *programmer bug* and panics in debug builds. Reading the fd
+    // directly surfaces it as `error.WouldBlock`.
     while (true) {
         std.debug.assert(pos < buf.len);
-        var vecs: [1][]u8 = .{buf[pos..]};
-        const n = r.readVec(&vecs) catch |err|
-            switch (err) {
-                error.ReadFailed => {
-                    if (reader.err) |e| {
-                        switch (e) {
-                            // @ZIG016
-                            // error.WouldBlock => {
-                            //     if (blocked) unreachable;
-                            //     blocked = true;
-                            //     std.Thread.sleep(std.time.ns_per_ms);
-                            //     continue;
-                            // },
-                            else => @panic(@errorName(e)),
-                        }
-                    }
-                    @panic(@errorName(err));
-                },
-                error.EndOfStream => 0,
-            };
+        const n = posix.read(socket, buf[pos..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                // The websocket upgrade does a little handshake work, so allow
+                // one retry before giving up.
+                if (blocked) @panic("timed out reading response header");
+                blocked = true;
+                t.io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
+                continue;
+            },
+            else => @panic(@errorName(err)),
+        };
 
         if (n == 0) unreachable;
 

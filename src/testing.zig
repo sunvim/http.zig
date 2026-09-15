@@ -179,11 +179,7 @@ pub const Testing = struct {
             return error.NoContentEncoding;
         }
 
-        var fbs = std.io.fixedBufferStream(res.body);
-        var uncompressed = std.ArrayList(u8).init(self.arena);
-        try std.compress.gzip.decompress(fbs.reader(), uncompressed.writer());
-
-        res.body = uncompressed.items;
+        res.body = try gunzip(self.arena, res.body);
         self.parsed_response = res;
     }
 
@@ -241,6 +237,21 @@ pub const Testing = struct {
 
 pub fn parse(data: []u8) !Testing.Response {
     return parseWithAllocator(t.allocator, data);
+}
+
+// Zig 0.16 moved gzip out of `std.compress.gzip` and into
+// `std.compress.flate`, where the container is explicit and the caller has to
+// supply a history window at least `max_window_len` bytes long.
+fn gunzip(allocator: Allocator, body: []const u8) ![]u8 {
+    var input: std.Io.Reader = .fixed(body);
+    const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(window);
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, window);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    _ = try decompress.reader.streamRemaining(&out.writer);
+    return out.toOwnedSlice();
 }
 
 pub fn parseWithAllocator(allocator: Allocator, data: []u8) !Testing.Response {
@@ -664,4 +675,20 @@ test "testing: expectStatusCode" {
     ht.res.status = 201;
 
     try ht.expectStatusCode(.created);
+}
+
+test "testing: gunzip" {
+    // gzip of "the quick brown fox jumps over the lazy dog"
+    const gzipped = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x2b, 0xc9,
+        0x48, 0x55, 0x28, 0x2c, 0xcd, 0x4c, 0xce, 0x56, 0x48, 0x2a, 0xca, 0x2f,
+        0xcf, 0x53, 0x48, 0xcb, 0xaf, 0x50, 0xc8, 0x2a, 0xcd, 0x2d, 0x28, 0x56,
+        0xc8, 0x2f, 0x4b, 0x2d, 0x52, 0x28, 0x01, 0x4a, 0xe7, 0x24, 0x56, 0x55,
+        0x2a, 0xa4, 0xe4, 0xa7, 0x03, 0x00, 0x14, 0x51, 0x0c, 0xce, 0x2b, 0x00,
+        0x00, 0x00,
+    };
+
+    const plain = try gunzip(t.allocator, &gzipped);
+    defer t.allocator.free(plain);
+    try t.expectString("the quick brown fox jumps over the lazy dog", plain);
 }

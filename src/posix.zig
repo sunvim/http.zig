@@ -441,9 +441,18 @@ pub const Address = extern union {
                 return .{ .ip4 = .{ .bytes = bytes.*, .port = std.mem.bigToNative(u16, self.in.port) } };
             },
             posix.AF.INET6 => {
-                // @ZIG016 I don't think this is correct
-                const bytes: *const [16]u8 = @ptrCast(&self.in.addr);
-                return .{ .ip6 = .{ .bytes = bytes.*, .port = std.mem.bigToNative(u16, self.in.port) } };
+                // NOTE: this must read from the `in6` member, not `in`. The two
+                // have different layouts (`sockaddr.in.addr` is a u32 at offset
+                // 4, while `sockaddr.in6.addr` is the [16]u8 at offset 8), so
+                // casting `&self.in.addr` to a `*const [16]u8` only ever worked
+                // by accident on some platforms.
+                const in6 = self.in6;
+                return .{ .ip6 = .{
+                    .bytes = in6.addr,
+                    .port = std.mem.bigToNative(u16, in6.port),
+                    .flow = in6.flowinfo,
+                    .interface = .{ .index = in6.scope_id },
+                } };
             },
             else => .{ .ip4 = .unspecified(0) },
         };
@@ -857,5 +866,46 @@ pub fn epoll_wait(epfd: i32, events: []system.epoll_event, timeout: i32) usize {
             .INVAL => unreachable,
             else => unreachable,
         }
+    }
+}
+
+test "Address: toIOAddress" {
+    const t = std.testing;
+
+    {
+        const address = try Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
+        const io_address = address.toIOAddress();
+        try t.expectEqual(@as(u16, 8080), io_address.ip4.port);
+        try t.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &io_address.ip4.bytes);
+
+        var buf: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try address.format(&w);
+        try t.expectEqualStrings("127.0.0.1:8080", w.buffered());
+    }
+
+    {
+        // Regression test: this used to read through the `in` (IPv4) union
+        // member, which produced a byte-shifted address.
+        const address = try Address.initIp6(
+            .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 },
+            8080,
+            0x1234,
+            3,
+        );
+        const io_address = address.toIOAddress();
+        try t.expectEqual(@as(u16, 8080), io_address.ip6.port);
+        try t.expectEqualSlices(
+            u8,
+            &.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 },
+            &io_address.ip6.bytes,
+        );
+        try t.expectEqual(@as(u32, 0x1234), io_address.ip6.flow);
+        try t.expectEqual(@as(u32, 3), io_address.ip6.interface.index);
+
+        var buf: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try address.format(&w);
+        try t.expectEqualStrings("[2001:db8::1]:8080", w.buffered());
     }
 }

@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) !void {
     const websocket_module = b.dependency("websocket", dep_opts).module("websocket");
 
     const enable_tsan = b.option(bool, "tsan", "Enable ThreadSanitizer");
+    const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
 
     const httpz_module = b.addModule("httpz", .{
         .link_libc = true,
@@ -26,6 +27,14 @@ pub fn build(b: *std.Build) !void {
         options.addOption(bool, "httpz_blocking", false);
         httpz_module.addOptions("build", options);
     }
+    {
+        // The websocket dependency picks its blocking vs non-blocking worker at
+        // comptime from this option. httpz's blocking worker calls into the
+        // blocking websocket worker (`readLoop`), so the two must agree.
+        const options = b.addOptions();
+        options.addOption(bool, "websocket_blocking", force_blocking);
+        websocket_module.addOptions("build", options);
+    }
 
     {
         const test_filter = b.option([]const []const u8, "test-filter", "Filters for test: specify multiple times for multiple filters");
@@ -35,16 +44,10 @@ pub fn build(b: *std.Build) !void {
             .filters = test_filter orelse &.{},
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
-        const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
         {
             const options = b.addOptions();
             options.addOption(bool, "httpz_blocking", force_blocking);
             tests.root_module.addOptions("build", options);
-        }
-        {
-            // const options = b.addOptions();
-            // options.addOption(bool, "websocket_blocking", force_blocking);
-            // websocket_module.addOptions("build", options);
         }
 
         tests.root_module.addImport("metrics", metrics_module);
@@ -69,8 +72,7 @@ pub fn build(b: *std.Build) !void {
         .{ .file = "examples/06_middleware.zig", .name = "example_6" },
         .{ .file = "examples/07_advanced_routing.zig", .name = "example_7" },
         .{ .file = "examples/08_websocket.zig", .name = "example_8" },
-        // @ZIG016
-        // .{ .file = "examples/09_shutdown.zig", .name = "example_9", .libc = true },
+        .{ .file = "examples/09_shutdown.zig", .name = "example_9", .libc = true },
         .{ .file = "examples/10_file_upload.zig", .name = "example_10" },
         .{ .file = "examples/11_html_streaming.zig", .name = "example_11" },
     };

@@ -195,26 +195,21 @@ pub const Context = struct {
         var buf: [1024]u8 = undefined;
         var arr: std.ArrayList(u8) = .empty;
 
-        var reader = self.client.reader(io, &.{});
-        const r = &reader.interface;
+        // NOTE: this deliberately does not go through
+        // `std.Io.net.Stream.reader`. In 0.16 a socket read that times out
+        // (SO_RCVTIMEO, which tests set on every socket) is reported by the
+        // `Io` vtable as a *programmer bug* and panics in debug builds. Reading
+        // the fd directly surfaces it as `error.WouldBlock`, which is what we
+        // want here: whatever we've buffered is all we're going to get.
+        const socket = self.client.socket.handle;
         while (true) {
-            const n = r.readSliceShort(&buf) catch |err|
-                switch (err) {
-                    error.ReadFailed => {
-                        // @ZIG016
-                        // if (reader.err) |e| {
-                        //     switch (e) {
-                        //         error.WouldBlock => return arr,
-                        //         else => return e,
-                        //     }
-                        // }
-                        return err;
-                    },
-                };
+            const n = posix.read(socket, &buf) catch |err| switch (err) {
+                error.WouldBlock => return arr,
+                else => return err,
+            };
             if (n == 0) return arr;
             try arr.appendSlice(a, buf[0..n]);
         }
-        unreachable;
     }
 
     pub fn expect(self: Context, expected: []const u8) !void {
